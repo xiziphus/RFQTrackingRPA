@@ -1,0 +1,288 @@
+/********************************************************
+ * 1) PROCESS NEW RFQs & AUTO-REPLY
+ ********************************************************/
+function processRFQs() {
+  // Label for processed emails
+  const labelName = "RFQ-Processed";
+
+  // Main tracker spreadsheet details
+  const spreadsheetId = "yourgooglesheetidgoeshere"; // Replace with your spreadsheet ID
+  const sheetName = "RFQ Tracker"; // Main RFQ sheet
+
+  // Search emails in the subject line with any of these keywords, exclude already processed
+  const query = 'subject:("request for quote" OR "RFQ sent" OR "RFQ needed") -label:RFQ-Processed newer_than:30d';
+  const threads = GmailApp.search(query);
+
+  console.log(`Found ${threads.length} email threads matching the RFQ query.`);
+
+  // Create "RFQ-Processed" label if not exists
+  let label = GmailApp.getUserLabelByName(labelName);
+  if (!label) {
+    label = GmailApp.createLabel(labelName);
+    console.log(`Created label: ${labelName}`);
+  }
+
+  // Open Google Sheet
+  const sheet = SpreadsheetApp.openById(spreadsheetId).getSheetByName(sheetName);
+  if (!sheet) {
+    throw new Error(`Sheet with name '${sheetName}' not found.`);
+  }
+
+  // Determine today's date in ddMMyy format
+  const today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "ddMMyy");
+
+  // Get existing serials (column A: Serial Number)
+  // Flatten since getValues() returns a 2D array
+  const lastRow = sheet.getLastRow();
+  let data = [];
+  if (lastRow > 1) {
+    data = sheet.getRange(2, 1, lastRow - 1, 1).getValues().flat().map(String);
+  }
+
+  // Find the last used serial number for today
+  let lastSerialForToday = 0;
+  data.forEach(serial => {
+    serial = serial.trim();
+    if (serial.startsWith(today)) {
+      const serialNum = parseInt(serial.slice(6), 10); // last 3 digits
+      if (serialNum > lastSerialForToday) {
+        lastSerialForToday = serialNum;
+      }
+    }
+  });
+  console.log(`Last serial number for today: ${lastSerialForToday}`);
+
+  let newRFQs = 0;
+  // Keep a set of all existing serial numbers to avoid duplicates
+  const serialNumberSet = new Set(data);
+
+  // Process each thread
+  threads.forEach(thread => {
+    const messages = thread.getMessages();
+    messages.forEach(message => {
+      try {
+        const msgId = message.getId();
+        const msgSubject = message.getSubject();
+        const msgSender = message.getFrom();
+        const msgDate = message.getDate();
+
+        // Check if already processed by ID (column F)
+        const idColumn = sheet.getRange(2, 6, sheet.getLastRow() - 1, 1).getValues().flat();
+        if (idColumn.includes(msgId)) {
+          console.log(`Email with ID ${msgId} is already processed. Skipping.`);
+          return;
+        }
+
+        // Generate a fresh serial number for today's date, ensuring uniqueness
+        let newSerial;
+        do {
+          lastSerialForToday++;
+          newSerial = `${today}${String(lastSerialForToday).padStart(3, "0")}`;
+        } while (serialNumberSet.has(newSerial));
+
+        // Mark it as used
+        serialNumberSet.add(newSerial);
+        newRFQs++;
+
+        // Append to RFQ Tracker
+        sheet.appendRow([
+          newSerial,
+          msgSender,
+          msgSubject,
+          Utilities.formatDate(msgDate, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss"),
+          "RFQ Received",
+          msgId
+        ]);
+
+        console.log(`Logged new RFQ: Serial Number - ${newSerial}, Sender - ${msgSender}`);
+
+        // Send acknowledgment auto-reply
+        const acknowledgmentBody =
+          `Dear ${msgSender},\n\n` +
+          `Thank you for your inquiry (RFQ). We have logged it with the serial number: ${newSerial}.\n` +
+          `Our team will review it and get back to you shortly.\n\nBest regards,\n[Your Company Name Here]`;
+
+        GmailApp.sendEmail(
+          msgSender,
+          `Acknowledgment of RFQ ${newSerial}`,
+          acknowledgmentBody
+        );
+        console.log(`Sent acknowledgment email for RFQ Serial Number: ${newSerial}`);
+
+        // Add the "RFQ-Processed" label to the thread
+        thread.addLabel(label);
+
+      } catch (err) {
+        console.error(`Error processing an email: ${err.message}`);
+      }
+    });
+  });
+
+  console.log(`Total new RFQs added: ${newRFQs}`);
+}
+
+
+/********************************************************
+ * 2) MONITOR FOR STATUS UPDATES IN EMAIL BODY
+ ********************************************************/
+function monitorUpdates() {
+  // Main spreadsheet and tabs
+  const spreadsheetId = "1Udk4ds1_G4kE3ywfmDgBK57HM00SFYYZ6TUj0Tp_MmM"; // Replace if needed
+  const sheetName = "RFQ Tracker"; 
+  const statusChangeSheetName = "Status Change Tracker"; 
+
+  // Keywords to look for in the body (exact match)
+  // and the status text we want to set in the main sheet
+  const updateKeywords = [
+    { keyword: "Data sheet shared", status: "Data sheet shared" },
+    { keyword: "Pricing shared", status: "Pricing shared" },
+    { keyword: "Order successfully received, lead to be closed", status: "Order received" }
+  ];
+
+  // Open main sheet
+  const mainSheet = SpreadsheetApp.openById(spreadsheetId).getSheetByName(sheetName);
+  if (!mainSheet) {
+    throw new Error(`Sheet with name '${sheetName}' not found.`);
+  }
+
+  // Open or create the Status Change Tracker sheet
+  let statusChangeSheet = SpreadsheetApp.openById(spreadsheetId).getSheetByName(statusChangeSheetName);
+  if (!statusChangeSheet) {
+    statusChangeSheet = SpreadsheetApp.openById(spreadsheetId).insertSheet(statusChangeSheetName);
+    // Add header row
+    statusChangeSheet.appendRow(["Serial Number", "Sender", "Subject", "Timestamp", "Status", "Message ID"]);
+    console.log(`Created sheet: ${statusChangeSheetName}`);
+  }
+
+  // Get all existing serial numbers from main sheet (column A)
+  const mainData = mainSheet.getDataRange().getValues().map(row => row[0]?.toString().trim());
+  console.log("Collected Serial Numbers from main sheet for cross-reference.");
+
+  // For each keyword, search emails and update statuses
+  updateKeywords.forEach(({ keyword, status }) => {
+    // Build Gmail search query:
+    // - in:all to broaden the search if needed
+    // - phrase in quotes to look for exact match
+    // - newer_than:30d to limit timeframe
+    const query = `in:all "${keyword}" newer_than:30d`;
+    const threads = GmailApp.search(query);
+
+    console.log(`Found ${threads.length} email threads containing keyword: "${keyword}"`);
+
+    threads.forEach(thread => {
+      const messages = thread.getMessages();
+
+      messages.forEach(message => {
+        try {
+          // We'll parse the subject for the serial number
+          const msgId = message.getId();
+          const msgSubject = message.getSubject();
+          const msgSender = message.getFrom();
+          const msgDate = message.getDate();
+
+          // Must have serial in subject in the form ddmmyyNNN
+          const serialMatch = msgSubject.match(/\b\d{6}\d{3}\b/);
+          if (!serialMatch) {
+            console.log(`Could not find a valid 9-digit serial in subject: "${msgSubject}". Skipping.`);
+            return;
+          }
+          const serialNumber = serialMatch[0].trim();
+
+          // Confirm the serial is present in our main sheet
+          const rowIndex = mainData.indexOf(serialNumber);
+          if (rowIndex === -1) {
+            console.log(`Serial number ${serialNumber} was not found in the main sheet. Skipping.`);
+            return;
+          }
+
+          // Update the status (column E = index 4) in main sheet
+          mainSheet.getRange(rowIndex + 1, 5).setValue(status);
+          console.log(`Updated status for Serial Number ${serialNumber} to "${status}".`);
+
+          // Log the status change in the Status Change Tracker sheet
+          statusChangeSheet.appendRow([
+            serialNumber,
+            msgSender,
+            msgSubject,
+            Utilities.formatDate(msgDate, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss"),
+            status,
+            msgId
+          ]);
+          console.log(`Logged status change for Serial Number ${serialNumber}.`);
+
+        } catch (err) {
+          console.error(`Error processing status update email: ${err.message}`);
+        }
+      });
+    });
+  });
+}
+
+
+/********************************************************
+ * 3) SEND DAILY REMINDER EMAIL WITH CURRENT STATUS
+ ********************************************************/
+function sendDailyReminder() {
+  const spreadsheetId = "1Udk4ds1_G4kE3ywfmDgBK57HM00SFYYZ6TUj0Tp_MmM";
+  const sheetName = "RFQ Tracker";
+  // Recipients list
+  const recipients = [
+    "prateek.singh@malhotracables.com",
+    "rubmfn@yopmail.com",
+    "rubmfn2@yopmail.com",
+    "rubmfn3@yopmail.com"
+  ];
+
+  const sheet = SpreadsheetApp.openById(spreadsheetId).getSheetByName(sheetName);
+  if (!sheet) {
+    throw new Error(`Sheet with name '${sheetName}' not found.`);
+  }
+
+  // Grab all rows in "RFQ Tracker"
+  const data = sheet.getDataRange().getValues(); 
+  if (data.length <= 1) {
+    console.log("No RFQs to report on today.");
+    return;
+  }
+
+  // Build a simple text summary of all RFQs and their status
+  let emailBody = "Daily RFQ Status Update:\n\n";
+  // data[0] is the header row, so skip it
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const serial = row[0];
+    const status = row[4];
+    emailBody += `Serial Number: ${serial}, Status: ${status}\n`;
+  }
+
+  recipients.forEach(recipient => {
+    GmailApp.sendEmail(recipient, "Daily RFQ Status Update", emailBody);
+    console.log(`Sent daily reminder to ${recipient}`);
+  });
+}
+
+
+/********************************************************
+ * 4) SETUP TRIGGERS
+ ********************************************************/
+function setupTriggers() {
+  // Runs processRFQs every 10 minutes
+  ScriptApp.newTrigger("processRFQs")
+    .timeBased()
+    .everyMinutes(10)
+    .create();
+
+  // Runs monitorUpdates every 10 minutes
+  ScriptApp.newTrigger("monitorUpdates")
+    .timeBased()
+    .everyMinutes(10)
+    .create();
+
+  // Runs sendDailyReminder every day at 8 AM
+  ScriptApp.newTrigger("sendDailyReminder")
+    .timeBased()
+    .atHour(8)
+    .everyDays(1)
+    .create();
+}
+
